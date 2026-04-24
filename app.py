@@ -1,9 +1,16 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import pickle, torch, torch.nn as nn
 import numpy as np, pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import defaultdict
-import os, time, threading, io
+import time, threading, io
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 app = Flask(__name__)
 CORS(app)
@@ -172,7 +179,7 @@ def _build_result(meta, rank):
 
 
 # ══════════════════════════════════════════════════════════════════
-# BUILD CATALOG — accepte un DataFrame déjà chargé
+# BUILD CATALOG
 # ══════════════════════════════════════════════════════════════════
 def _build_catalog(df: pd.DataFrame) -> dict:
     col_map = {
@@ -274,7 +281,7 @@ def _do_update(csv_bytes: bytes):
     global _update_state
     _update_state = {"running": True, "started_at": time.time(), "error": None}
     try:
-        df          = pd.read_csv(io.BytesIO(csv_bytes), dtype=str)
+        df          = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding="utf-8-sig")
         new_catalog = _build_catalog(df)
         _swap_catalog(new_catalog)
         _update_state["running"] = False
@@ -373,7 +380,7 @@ def recommend(actions, top_k=10, category_boost=5.0,
     valid_mask  = scores != -np.inf
     noise_sigma = NOISE_STD * float(np.std(scores[valid_mask])) if valid_mask.any() else 0.0
     if noise_sigma > 0:
-        noise             = np.random.normal(0.0, noise_sigma, size=scores.shape)
+        noise              = np.random.normal(0.0, noise_sigma, size=scores.shape)
         noise[~valid_mask] = 0.0
         scores            += noise
 
@@ -452,15 +459,6 @@ def health():
 
 @app.route("/update", methods=["POST"])
 def update_catalog():
-    """
-    Postman / frontend :
-      - Content-Type : multipart/form-data
-      - Champ        : file  (fichier CSV)
-
-    Le fichier est lu en mémoire (bytes) puis traité
-    dans un thread background → swap atomique.
-    Aucun fichier n'est écrit sur le disque.
-    """
     if "file" not in request.files:
         return jsonify({"success": False, "error": "Champ 'file' manquant."}), 400
 
@@ -476,8 +474,6 @@ def update_catalog():
             "started_at": _update_state.get("started_at"),
         }), 409
 
-    # Lire les bytes immédiatement (le fichier Flask n'est plus
-    # accessible hors du contexte de la requête)
     csv_bytes = file.read()
 
     def _run():
@@ -489,24 +485,14 @@ def update_catalog():
     threading.Thread(target=_run, daemon=True).start()
 
     return jsonify({
-        "success": True,
-        "message": "Chargement du catalog lancé en background.",
+        "success" : True,
+        "message" : "Chargement du catalog lancé en background.",
         "filename": file.filename,
     }), 202
 
 
 @app.route("/recommend", methods=["POST"])
 def recommend_route():
-    """
-    Body JSON :
-    {
-        "actions"       : [{"type": "product_view", "value": "CL-441"}, ...],
-        "top_k"         : 10,
-        "category_boost": 5.0,
-        "stock_filter"  : false,
-        "promo_only"    : false
-    }
-    """
     try:
         body    = request.get_json()
         actions = [(a["type"], a["value"]) for a in body.get("actions", [])]
