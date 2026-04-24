@@ -1,7 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
 flask==3.1.0
 flask-cors==5.0.0
 gunicorn==23.0.0
-torch
 numpy
 pandas
 python-dateutil

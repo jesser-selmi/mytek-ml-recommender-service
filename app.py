@@ -2,12 +2,18 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-import pickle, torch, torch.nn as nn
-import numpy as np, pandas as pd
+import gc
+import pickle
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import defaultdict
-import time, threading, io
+import time
+import threading
+import io
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
@@ -278,16 +284,107 @@ def _swap_catalog(new_catalog: dict):
 
 
 def _do_update(csv_bytes: bytes):
-    global _update_state
+    global _update_state, _active_catalog
+
     _update_state = {"running": True, "started_at": time.time(), "error": None}
     try:
-        df          = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding="utf-8-sig")
-        new_catalog = _build_catalog(df)
+        # ── Étape 1 : libérer l'ancien catalog AVANT de charger le nouveau ──
+        with _catalog_lock:
+            _active_catalog = None
+        gc.collect()
+
+        # ── Étape 2 : lire le CSV en chunks pour limiter le pic mémoire ──
+        cat_name_to_group   = {k.lower(): v for k, v in CAT_GROUPS.items()}
+        sku_meta            = {}
+        cat_group_to_skuidx = defaultdict(list)
+        level_cat_to_skuidx = defaultdict(list)
+
+        col_map = {
+            "mytek_référence"    : "sku",
+            "mytek_désignation"  : "designation",
+            "mytek_disponibilité": "stock",
+            "mytek_prix"         : "prix",
+            "mytek_prix_normal"  : "prix_normal",
+            "mytek_prix_special" : "prix_special",
+            "category1_name"     : "categorie",
+            "category2_name"     : "cat1",
+            "category3_name"     : "cat2",
+            "category4_name"     : "cat3",
+        }
+
+        reader = pd.read_csv(
+            io.BytesIO(csv_bytes),
+            dtype=str,
+            encoding="utf-8-sig",
+            chunksize=500,
+        )
+
+        for chunk in reader:
+            chunk = chunk.rename(columns={k: v for k, v in col_map.items() if k in chunk.columns})
+
+            if "mytek_url_article" in chunk.columns:
+                chunk["slug"] = (chunk["mytek_url_article"]
+                                 .str.extract(r"/([^/]+)\.html$", expand=False)
+                                 .fillna(""))
+
+            for _, row in chunk.iterrows():
+                sku = str(row.get("sku", "")).strip()
+                if not sku or sku not in sku2idx:
+                    continue
+
+                idx          = sku2idx[sku]
+                prix         = _safe_float(row.get("prix"))
+                prix_normal  = _safe_float(row.get("prix_normal")) or prix
+                prix_special = _safe_float(row.get("prix_special"))
+
+                if prix_special is not None and prix_normal is not None:
+                    if prix_special >= prix_normal:
+                        prix_special = None
+
+                categorie = str(row.get("categorie", "")).strip()
+                cat_group = cat_name_to_group.get(categorie.lower(), categorie)
+
+                meta = {
+                    "sku"         : sku,
+                    "designation" : str(row.get("designation", "")).strip(),
+                    "categorie"   : categorie,
+                    "cat_group"   : cat_group,
+                    "cat1"        : str(row.get("cat1", "")).strip() or None,
+                    "cat2"        : str(row.get("cat2", "")).strip() or None,
+                    "cat3"        : str(row.get("cat3", "")).strip() or None,
+                    "prix"        : prix,
+                    "prix_normal" : prix_normal,
+                    "prix_special": prix_special,
+                    "stock"       : _normalize_stock(row.get("stock", "")),
+                    "slug"        : str(row.get("slug", "")).strip(),
+                }
+
+                sku_meta[idx] = meta
+                cat_group_to_skuidx[cat_group].append(idx)
+                for level_i, cat_val in _get_cat_hierarchy(meta).items():
+                    level_cat_to_skuidx[(level_i, cat_val)].append(idx)
+
+        # ── Étape 3 : libérer csv_bytes et forcer GC ──
+        del csv_bytes
+        gc.collect()
+
+        new_catalog = {
+            "sku_meta"            : sku_meta,
+            "cat_group_to_skuidx" : cat_group_to_skuidx,
+            "level_cat_to_skuidx" : level_cat_to_skuidx,
+            "cat_name_to_group"   : cat_name_to_group,
+            "product_count"       : len(sku_meta),
+            "promo_count"         : sum(1 for m in sku_meta.values() if m["prix_special"] is not None),
+            "loaded_at"           : time.time(),
+        }
+
         _swap_catalog(new_catalog)
         _update_state["running"] = False
+
     except Exception as e:
         _update_state["running"] = False
         _update_state["error"]   = str(e)
+        gc.collect()
         raise
 
 
