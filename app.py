@@ -3,7 +3,7 @@ import numpy as np, pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import defaultdict
-import os, time, threading
+import os, time, threading, io
 
 app = Flask(__name__)
 CORS(app)
@@ -68,21 +68,8 @@ CAT_LEVELS         = ['cat_group', 'cat1', 'cat2', 'cat3', 'cat4']
 CAT_LEVEL_FACTORS  = [0.15, 0.30, 0.55, 0.75, 1.0]
 ACTION_BASE_WEIGHT = {'product_view': 1.0, 'add_to_cart': 3.0, 'category_view': 0.5}
 
-
-# ══════════════════════════════════════════════════════════════════
-# CONSTANTES DIVERSITÉ
-# ══════════════════════════════════════════════════════════════════
-# ① Bruit gaussien : fraction de std(logits) ajoutée comme perturbation
-#    0.0 = désactivé  |  plage utile : 0.05 – 0.15
 NOISE_STD   = 0.08
-
-# ② Temperature sampling : aplatit la distribution de probabilité sur le pool
-#    1.0 = argsort pur (déterministe)  |  plage utile : 1.2 – 2.0
 TEMPERATURE = 1.5
-
-# ③ Epsilon-greedy : fraction des résultats remplacés par un item
-#    de même catégorie choisi aléatoirement dans le catalog
-#    0.0 = désactivé  |  plage utile : 0.10 – 0.20
 EPSILON     = 0.15
 
 
@@ -163,7 +150,6 @@ def _passes_filters(meta, stock_filter, promo_only):
 
 
 def _build_result(meta, rank):
-    """Construit le dict résultat à partir d'un meta item."""
     prix_special = meta["prix_special"]
     prix_normal  = meta["prix_normal"]
     if prix_normal and prix_special and prix_special >= prix_normal:
@@ -186,11 +172,9 @@ def _build_result(meta, rank):
 
 
 # ══════════════════════════════════════════════════════════════════
-# BUILD CATALOG
+# BUILD CATALOG — accepte un DataFrame déjà chargé
 # ══════════════════════════════════════════════════════════════════
-def _build_catalog(csv_path: str) -> dict:
-    df = pd.read_csv(csv_path, dtype=str)
-
+def _build_catalog(df: pd.DataFrame) -> dict:
     col_map = {
         "mytek_référence"    : "sku",
         "mytek_désignation"  : "designation",
@@ -260,8 +244,6 @@ def _build_catalog(csv_path: str) -> dict:
         "product_count"       : len(sku_meta),
         "promo_count"         : sum(1 for m in sku_meta.values() if m["prix_special"] is not None),
         "loaded_at"           : time.time(),
-        "csv_path"            : csv_path,
-        "status"              : "active",
     }
 
 
@@ -269,36 +251,31 @@ def _build_catalog(csv_path: str) -> dict:
 # BLUE / GREEN CATALOG SLOT
 # ══════════════════════════════════════════════════════════════════
 _active_catalog: dict | None = None
-_catalog_lock   = threading.Lock()
-_update_lock    = threading.Lock()
+_catalog_lock                = threading.Lock()
+_update_lock                 = threading.Lock()
 
-_update_state = {
-    "running"   : False,
-    "started_at": None,
-    "error"     : None,
-}
+_update_state = {"running": False, "started_at": None, "error": None}
 
 
 def _get_active_catalog() -> dict:
     with _catalog_lock:
         if _active_catalog is None:
-            raise RuntimeError("Aucun catalog actif. Appelez POST /update d'abord.")
+            raise RuntimeError("Aucun catalog actif. Uploadez un CSV via POST /update.")
         return _active_catalog
 
 
 def _swap_catalog(new_catalog: dict):
-    """Remplace atomiquement le slot actif. L'ancien est déréférencé → GC."""
     global _active_catalog
     with _catalog_lock:
         _active_catalog = new_catalog
 
 
-def _do_update(csv_path: str):
-    """Exécuté dans un thread background par /update."""
+def _do_update(csv_bytes: bytes):
     global _update_state
     _update_state = {"running": True, "started_at": time.time(), "error": None}
     try:
-        new_catalog = _build_catalog(csv_path)
+        df          = pd.read_csv(io.BytesIO(csv_bytes), dtype=str)
+        new_catalog = _build_catalog(df)
         _swap_catalog(new_catalog)
         _update_state["running"] = False
     except Exception as e:
@@ -382,11 +359,9 @@ def recommend(actions, top_k=10, category_boost=5.0,
         logits, _ = model(t_in)
     scores = logits[0].cpu().numpy().copy()
 
-    # Masquer les items déjà vus / dans le panier
     for idx in (viewed_skus | cart_skus):
         scores[idx - 1] = -np.inf
 
-    # Category boost (logique métier inchangée)
     if cat_level_scores:
         max_acc = max(cat_level_scores.values())
         for (level_i, cat_val), acc_score in cat_level_scores.items():
@@ -395,33 +370,23 @@ def recommend(actions, top_k=10, category_boost=5.0,
                 if scores[idx - 1] != -np.inf:
                     scores[idx - 1] += boost
 
-    # ── ① Bruit gaussien calibré ──────────────────────────────────
-    # σ proportionnel à l'écart-type des scores valides,
-    # donc auto-adapté quelle que soit la magnitude des logits.
     valid_mask  = scores != -np.inf
     noise_sigma = NOISE_STD * float(np.std(scores[valid_mask])) if valid_mask.any() else 0.0
     if noise_sigma > 0:
-        noise            = np.random.normal(0.0, noise_sigma, size=scores.shape)
-        noise[~valid_mask] = 0.0   # ne pas perturber les items masqués
-        scores           += noise
+        noise             = np.random.normal(0.0, noise_sigma, size=scores.shape)
+        noise[~valid_mask] = 0.0
+        scores            += noise
 
-    # ── ② Temperature sampling sur le pool élargi ─────────────────
-    # On extrait les top-K×25 candidats, on applique une softmax
-    # tempérée, puis on tire sans remise pour construire le classement.
     pool_size   = top_k * 25
     top_pool    = np.argsort(scores)[-pool_size:][::-1]
     pool_scores = scores[top_pool]
+    shifted     = pool_scores - pool_scores.max()
+    probs       = np.exp(shifted / TEMPERATURE)
+    probs      /= probs.sum()
 
-    # Softmax numérique stable
-    shifted = pool_scores - pool_scores.max()
-    probs   = np.exp(shifted / TEMPERATURE)
-    probs  /= probs.sum()
-
-    # Tirage sans remise pondéré → top_k×3 candidats pour absorber les filtres
     sample_size = min(top_k * 3, pool_size)
     sampled     = np.random.choice(top_pool, size=sample_size, replace=False, p=probs)
 
-    # ── Construction de la liste principale ───────────────────────
     results, seen = [], set()
 
     for raw_idx in sampled:
@@ -433,22 +398,16 @@ def recommend(actions, top_k=10, category_boost=5.0,
             continue
         if not _passes_filters(meta, stock_filter, promo_only):
             continue
-
         seen.add(meta["sku"])
         results.append(_build_result(meta, len(results) + 1))
-
         if len(results) >= top_k:
             break
 
-    # ── ③ Epsilon-greedy : swap catégoriel ────────────────────────
-    # ~EPSILON × len(results) positions sont remplacées par un item
-    # aléatoire de la même cat_group, hors déjà vus, respectant les filtres.
     if results and EPSILON > 0:
-        n_swap        = max(1, round(len(results) * EPSILON))
+        n_swap         = max(1, round(len(results) * EPSILON))
         swap_positions = np.random.choice(
             len(results), size=min(n_swap, len(results)), replace=False
         ).tolist()
-
         for pos in swap_positions:
             original_cat = results[pos]["cat_group"]
             pool = [
@@ -458,8 +417,7 @@ def recommend(actions, top_k=10, category_boost=5.0,
                 and _passes_filters(sku_meta[idx], stock_filter, promo_only)
             ]
             if not pool:
-                continue   # pas de candidat disponible → on garde l'original
-
+                continue
             idx  = int(np.random.choice(pool))
             meta = sku_meta[idx]
             seen.add(meta["sku"])
@@ -481,7 +439,6 @@ def health():
             "products"      : catalog["product_count"],
             "promo_count"   : catalog["promo_count"],
             "catalog_age_s" : round(time.time() - catalog["loaded_at"]),
-            "csv_path"      : catalog["csv_path"],
             "update_running": _update_state["running"],
         })
     except RuntimeError as e:
@@ -496,26 +453,21 @@ def health():
 @app.route("/update", methods=["POST"])
 def update_catalog():
     """
-    Lance le chargement d'un nouveau CSV en background.
-    /recommend continue de servir l'ancien catalog pendant le chargement.
-    Une fois prêt, le swap est atomique.
+    Postman / frontend :
+      - Content-Type : multipart/form-data
+      - Champ        : file  (fichier CSV)
 
-    Body JSON :
-    {
-        "csv_path": "C:/chemin/vers/export_1.csv"   // obligatoire
-    }
-
-    Réponses :
-    - 202 : chargement lancé en background
-    - 400 : csv_path manquant
-    - 409 : une mise à jour est déjà en cours
-    - 500 : erreur inattendue
+    Le fichier est lu en mémoire (bytes) puis traité
+    dans un thread background → swap atomique.
+    Aucun fichier n'est écrit sur le disque.
     """
-    body     = request.get_json(silent=True) or {}
-    csv_path = body.get("csv_path", "").strip()
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": "Champ 'file' manquant."}), 400
 
-    if not csv_path:
-        return jsonify({"success": False, "error": "csv_path requis"}), 400
+    file = request.files["file"]
+
+    if not file.filename or not file.filename.endswith(".csv"):
+        return jsonify({"success": False, "error": "Le fichier doit être un .csv"}), 400
 
     if not _update_lock.acquire(blocking=False):
         return jsonify({
@@ -524,9 +476,13 @@ def update_catalog():
             "started_at": _update_state.get("started_at"),
         }), 409
 
+    # Lire les bytes immédiatement (le fichier Flask n'est plus
+    # accessible hors du contexte de la requête)
+    csv_bytes = file.read()
+
     def _run():
         try:
-            _do_update(csv_path)
+            _do_update(csv_bytes)
         finally:
             _update_lock.release()
 
@@ -535,7 +491,7 @@ def update_catalog():
     return jsonify({
         "success": True,
         "message": "Chargement du catalog lancé en background.",
-        "csv_path": csv_path,
+        "filename": file.filename,
     }), 202
 
 
